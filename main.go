@@ -87,8 +87,8 @@ var table = routeTable{
 
 var networkQuery string
 var eventsQuery = "http://localhost" + dockerQuery("/events", map[string][]string{
-	"type":  {"network", "container"},
-	"event": {"connect", "disconnect", "start"},
+	"type":  {"container"},
+	"event": {"start", "stop"},
 })
 
 // dockerClient talks to the Docker daemon over the unix socket.
@@ -179,19 +179,6 @@ func proxy(writer http.ResponseWriter, request *http.Request) {
 }
 
 func watchEvents() {
-	// Initial scan on startup.
-	var containers []dockerContainer
-	if err := dockerGet(networkQuery, &containers); err != nil {
-		log.Printf("containers: %v", err)
-	}
-
-	for _, container := range containers {
-		table.Lock()
-		table.containers[container.ID] = nil
-		table.Unlock()
-		addRoutes(container.ID)
-	}
-
 	for {
 		if err := eventLoop(); err != nil {
 			log.Printf("events: %v", err)
@@ -202,11 +189,21 @@ func watchEvents() {
 
 // Listen for docker events
 func eventLoop() error {
+	// Start listening for events before scanning to avoid race conditions.
 	response, err := dockerClient.Get(eventsQuery)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = response.Body.Close() }()
+
+	// Scan existing containers on the network.
+	var containers []dockerContainer
+	if err := dockerGet(networkQuery, &containers); err != nil {
+		log.Printf("containers: %v", err)
+	}
+	for _, container := range containers {
+		addRoutes(container.ID)
+	}
 
 	jsonDecoder := json.NewDecoder(response.Body)
 	for {
@@ -216,27 +213,12 @@ func eventLoop() error {
 		}
 
 		switch {
-		// Track containers that are connected to the current network
-		case event.Type == "network" && event.Actor.Attributes["name"] == networkName:
-			containerID := ContainerID(event.Actor.Attributes["container"])
-			if event.Action == "connect" {
-				table.Lock()
-				table.containers[containerID] = nil
-				table.Unlock()
-			} else {
-				removeRoutes(containerID)
-			}
-
-		// Wait for the container to start before routing
-		case event.Type == "container":
-			// Ignore out of network containers
-			table.RLock()
-			_, ok := table.containers[event.Actor.ID]
-			table.RUnlock()
-			if !ok {
-				continue
-			}
+		// Query the container's network on start and add routes if on our network
+		case event.Action == "start":
 			addRoutes(event.Actor.ID)
+		// Remove routes when a container stops
+		case event.Action == "stop":
+			removeRoutes(event.Actor.ID)
 		}
 	}
 }
@@ -258,25 +240,28 @@ func dockerQuery(path string, filters interface{}) string {
 
 // Parse a container's route config
 func addRoutes(containerID ContainerID) {
+	removeRoutes(containerID)
+
 	var container dockerInspect
 	if err := dockerGet("/containers/"+string(containerID)+"/json", &container); err != nil {
 		log.Printf("inspect %s: %v", containerID[:12], err)
 		return
 	}
 
+	// Ignore containers in other networks
+	network, ok := container.NetworkSettings.Networks[networkName]
+	if !ok || network.IPAddress == "" {
+		return
+	}
+
 	var config string
 	for _, env := range container.Config.Env {
-		if strings.HasPrefix(env, "SUB2PORT=") {
-			config = strings.TrimPrefix(env, "SUB2PORT=")
+		if _config, ok := strings.CutPrefix(env, "SUB2PORT="); ok {
+			config = _config
 			break
 		}
 	}
 	if config == "" {
-		return
-	}
-
-	network, ok := container.NetworkSettings.Networks[networkName]
-	if !ok || network.IPAddress == "" {
 		return
 	}
 
