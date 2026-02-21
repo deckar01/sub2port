@@ -15,22 +15,21 @@ import (
 	"time"
 )
 
-// route maps a domain to a container backend.
-type route struct {
-	Name string
-	Host string
-	Port string
-}
+type ContainerID string
+type ContainerName string
+type HostName string
+
+// Docker API
 
 type dockerContainer struct {
-	ID string `json:"Id"`
+	ID ContainerID `json:"Id"`
 }
 
 type dockerEvent struct {
 	Type   string `json:"Type"`
 	Action string `json:"Action"`
 	Actor  struct {
-		ID         string            `json:"ID"`
+		ID         ContainerID       `json:"ID"`
 		Attributes map[string]string `json:"Attributes"`
 	} `json:"Actor"`
 }
@@ -52,12 +51,39 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
-var routesLock sync.RWMutex
-var routes = map[string]route{}
+// Types
+
+type route struct {
+	Name ContainerName
+	Host string
+	Port string
+}
+
+type hostEntry struct {
+	backends []route
+	counter  uint64
+}
+
+type binding struct {
+	Domain HostName
+	Name   ContainerName
+}
+
+type routeTable struct {
+	sync.RWMutex
+	hosts      map[HostName]*hostEntry
+	containers map[ContainerID][]binding
+}
+
+// State
+
 var networkName string
 var hostPort string
-var nodes = map[string]struct{}{}
-var registry = map[string][]string{}
+
+var table = routeTable{
+	hosts:      make(map[HostName]*hostEntry),
+	containers: make(map[ContainerID][]binding),
+}
 
 var networkQuery string
 var eventsQuery = "http://localhost" + dockerQuery("/events", map[string][]string{
@@ -73,6 +99,8 @@ var dockerClient = &http.Client{
 		},
 	},
 }
+
+// Router
 
 func main() {
 	var err error
@@ -117,9 +145,9 @@ func detectNetwork() (string, string, error) {
 	// Detect the host port mapped to the container.
 	port := "80"
 	for _, bindings := range container.NetworkSettings.Ports {
-		for _, b := range bindings {
-			if b.HostPort != "" {
-				port = b.HostPort
+		for _, binding := range bindings {
+			if binding.HostPort != "" {
+				port = binding.HostPort
 				break
 			}
 		}
@@ -132,18 +160,21 @@ func detectNetwork() (string, string, error) {
 }
 
 func proxy(writer http.ResponseWriter, request *http.Request) {
-	host := strings.Split(request.Host, ":")[0]
+	host := HostName(strings.Split(request.Host, ":")[0])
 
-	routesLock.RLock()
-	route, ok := routes[host]
-	routesLock.RUnlock()
-
-	if !ok {
+	table.Lock()
+	entry := table.hosts[host]
+	if entry == nil {
+		table.Unlock()
 		http.Error(writer, fmt.Sprintf("no backend for %s", host), http.StatusBadGateway)
 		return
 	}
+	idx := entry.counter % uint64(len(entry.backends))
+	entry.counter++
+	backend := entry.backends[idx]
+	table.Unlock()
 
-	target, _ := url.Parse(fmt.Sprintf("http://%s:%s", route.Host, route.Port))
+	target, _ := url.Parse(fmt.Sprintf("http://%s:%s", backend.Host, backend.Port))
 	httputil.NewSingleHostReverseProxy(target).ServeHTTP(writer, request)
 }
 
@@ -155,7 +186,9 @@ func watchEvents() {
 	}
 
 	for _, container := range containers {
-		nodes[container.ID] = struct{}{}
+		table.Lock()
+		table.containers[container.ID] = nil
+		table.Unlock()
 		addRoutes(container.ID)
 	}
 
@@ -173,7 +206,7 @@ func eventLoop() error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 
 	jsonDecoder := json.NewDecoder(response.Body)
 	for {
@@ -185,19 +218,22 @@ func eventLoop() error {
 		switch {
 		// Track containers that are connected to the current network
 		case event.Type == "network" && event.Actor.Attributes["name"] == networkName:
-			containerID := event.Actor.Attributes["container"]
+			containerID := ContainerID(event.Actor.Attributes["container"])
 			if event.Action == "connect" {
-				nodes[containerID] = struct{}{}
+				table.Lock()
+				table.containers[containerID] = nil
+				table.Unlock()
 			} else {
-				// Remove routes when containers disconnect
-				delete(nodes, containerID)
 				removeRoutes(containerID)
 			}
 
 		// Wait for the container to start before routing
 		case event.Type == "container":
 			// Ignore out of network containers
-			if _, ok := nodes[event.Actor.ID]; !ok {
+			table.RLock()
+			_, ok := table.containers[event.Actor.ID]
+			table.RUnlock()
+			if !ok {
 				continue
 			}
 			addRoutes(event.Actor.ID)
@@ -210,7 +246,7 @@ func dockerGet(path string, out interface{}) error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	return json.NewDecoder(response.Body).Decode(out)
 }
 
@@ -221,9 +257,9 @@ func dockerQuery(path string, filters interface{}) string {
 }
 
 // Parse a container's route config
-func addRoutes(containerID string) {
+func addRoutes(containerID ContainerID) {
 	var container dockerInspect
-	if err := dockerGet("/containers/"+containerID+"/json", &container); err != nil {
+	if err := dockerGet("/containers/"+string(containerID)+"/json", &container); err != nil {
 		log.Printf("inspect %s: %v", containerID[:12], err)
 		return
 	}
@@ -244,17 +280,16 @@ func addRoutes(containerID string) {
 		return
 	}
 
-	name := strings.TrimPrefix(container.Name, "/")
+	name := ContainerName(strings.TrimPrefix(container.Name, "/"))
 
-	// Default port: first exposed port, else 80.
 	defaultPort := "80"
 	for _port := range container.Config.ExposedPorts {
 		defaultPort = strings.Split(_port, "/")[0] // "8080/tcp" -> "8080"
 		break
 	}
 
-	var domains []string
-	routesLock.Lock()
+	var bindings []binding
+	table.Lock()
 	for _, entry := range strings.Split(config, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
@@ -265,23 +300,38 @@ func addRoutes(containerID string) {
 			domain = _domain
 			port = _port
 		}
-		routes[domain] = route{Name: name, Host: network.IPAddress, Port: port}
-		domains = append(domains, domain)
-		log.Printf("+ %s -> %s:%s", domain, name, port)
+		hostName := HostName(domain)
+		entry := table.hosts[hostName]
+		if entry == nil {
+			entry = &hostEntry{}
+			table.hosts[hostName] = entry
+		}
+		entry.backends = append(entry.backends, route{Name: name, Host: network.IPAddress, Port: port})
+		bindings = append(bindings, binding{Domain: hostName, Name: name})
+		log.Printf("+ %s (%d) -> %s:%s", domain, len(entry.backends), name, port)
 	}
-	registry[containerID] = domains
-	routesLock.Unlock()
+	table.containers[containerID] = bindings
+	table.Unlock()
 }
 
-// Remove routes to a container
-func removeRoutes(containerID string) {
-	routesLock.Lock()
-	for _, domain := range registry[containerID] {
-		if route, ok := routes[domain]; ok {
-			log.Printf("- %s -> %s:%s", domain, route.Name, route.Port)
-			delete(routes, domain)
+func removeRoutes(containerID ContainerID) {
+	table.Lock()
+	for _, binding := range table.containers[containerID] {
+		entry := table.hosts[binding.Domain]
+		if entry == nil {
+			continue
+		}
+		for i, route := range entry.backends {
+			if route.Name == binding.Name {
+				log.Printf("- %s (%d) -> %s:%s", binding.Domain, len(entry.backends)-1, route.Name, route.Port)
+				entry.backends = append(entry.backends[:i], entry.backends[i+1:]...)
+				break
+			}
+		}
+		if len(entry.backends) == 0 {
+			delete(table.hosts, binding.Domain)
 		}
 	}
-	delete(registry, containerID)
-	routesLock.Unlock()
+	delete(table.containers, containerID)
+	table.Unlock()
 }

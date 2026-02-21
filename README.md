@@ -1,9 +1,10 @@
 # Sub 2 Port
 
-- Route requests to docker containers by host name.
-- Containers declare their own host name, so the config is decentralized.
-- The routing table updates automatically in response to docker events.
-- Ports never have to be exposed, so no more errors about ports already in use.
+- Route requests to docker containers by host name
+- Containers declare their own host name, so the config is decentralized
+- The routing table updates automatically in response to docker events
+- Ports never have to be exposed, so no more errors about ports already in use
+- Multiple container bound to the same host name are routed round-robin
 
 ## Compose
 
