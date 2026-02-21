@@ -1,0 +1,14 @@
+services:
+  sub2port:
+    image: deckar01/sub2port
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - p80
+    restart: unless-stopped
+
+networks:
+  p80:
+    name: p80

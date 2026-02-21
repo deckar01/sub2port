@@ -15,17 +15,55 @@ import (
 	"time"
 )
 
-// route maps an FQDN to a container backend.
+// route maps a domain to a container backend.
 type route struct {
+	Name string
 	Host string
 	Port string
 }
 
-var (
-	mu          sync.RWMutex
-	routes      = map[string]route{}
-	networkName string // discovered at startup
-)
+type dockerContainer struct {
+	ID string `json:"Id"`
+}
+
+type dockerEvent struct {
+	Type   string `json:"Type"`
+	Action string `json:"Action"`
+	Actor  struct {
+		ID         string            `json:"ID"`
+		Attributes map[string]string `json:"Attributes"`
+	} `json:"Actor"`
+}
+
+type dockerInspect struct {
+	Name   string `json:"Name"`
+	Config struct {
+		Env          []string            `json:"Env"`
+		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+	} `json:"Config"`
+	NetworkSettings struct {
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
+}
+
+var routesLock sync.RWMutex
+var routes = map[string]route{}
+var networkName string
+var hostPort string
+var nodes = map[string]struct{}{}
+var registry = map[string][]string{}
+
+var networkQuery string
+var eventsQuery = "http://localhost" + dockerQuery("/events", map[string][]string{
+	"type":  {"network", "container"},
+	"event": {"connect", "disconnect", "start"},
+})
 
 // dockerClient talks to the Docker daemon over the unix socket.
 var dockerClient = &http.Client{
@@ -38,212 +76,212 @@ var dockerClient = &http.Client{
 
 func main() {
 	var err error
-	networkName, err = detectNetwork()
+	networkName, hostPort, err = detectNetwork()
 	if err != nil {
 		log.Fatalf("detect network: %v", err)
 	}
-	log.Printf("using network %q", networkName)
+	log.Printf("# using network %q", networkName)
+	networkQuery = dockerQuery("/containers/json", map[string][]string{
+		"network": {networkName},
+	})
 
 	go watchEvents()
-	log.Println("listening on :80")
+	log.Printf("# listening on :%s", hostPort)
 	log.Fatal(http.ListenAndServe(":80", http.HandlerFunc(proxy)))
 }
 
-func proxy(w http.ResponseWriter, r *http.Request) {
-	host := strings.Split(r.Host, ":")[0]
+// Inspect the network name and host port
+func detectNetwork() (string, string, error) {
+	hostname, err := os.ReadFile("/etc/hostname")
+	if err != nil {
+		return "", "", fmt.Errorf("read /etc/hostname: %w", err)
+	}
+	containerID := strings.TrimSpace(string(hostname))
 
-	mu.RLock()
-	rt, ok := routes[host]
-	mu.RUnlock()
+	var container dockerInspect
+	if err := dockerGet("/containers/"+containerID+"/json", &container); err != nil {
+		return "", "", fmt.Errorf("inspect self: %w", err)
+	}
+
+	var network string
+	for name := range container.NetworkSettings.Networks {
+		if name != "bridge" && name != "host" && name != "none" {
+			network = name
+			break
+		}
+	}
+	if network == "" {
+		return "", "", fmt.Errorf("no custom network found on container %s", containerID)
+	}
+
+	// Detect the host port mapped to the container.
+	port := "80"
+	for _, bindings := range container.NetworkSettings.Ports {
+		for _, b := range bindings {
+			if b.HostPort != "" {
+				port = b.HostPort
+				break
+			}
+		}
+		if port != "80" {
+			break
+		}
+	}
+
+	return network, port, nil
+}
+
+func proxy(writer http.ResponseWriter, request *http.Request) {
+	host := strings.Split(request.Host, ":")[0]
+
+	routesLock.RLock()
+	route, ok := routes[host]
+	routesLock.RUnlock()
 
 	if !ok {
-		http.Error(w, fmt.Sprintf("no backend for %s", host), http.StatusBadGateway)
+		http.Error(writer, fmt.Sprintf("no backend for %s", host), http.StatusBadGateway)
 		return
 	}
 
-	target, _ := url.Parse(fmt.Sprintf("http://%s:%s", rt.Host, rt.Port))
-	httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
+	target, _ := url.Parse(fmt.Sprintf("http://%s:%s", route.Host, route.Port))
+	httputil.NewSingleHostReverseProxy(target).ServeHTTP(writer, request)
 }
 
 func watchEvents() {
 	// Initial scan on startup.
-	if err := scan(); err != nil {
-		log.Printf("scan: %v", err)
+	var containers []dockerContainer
+	if err := dockerGet(networkQuery, &containers); err != nil {
+		log.Printf("containers: %v", err)
+	}
+
+	for _, container := range containers {
+		nodes[container.ID] = struct{}{}
+		addRoutes(container.ID)
 	}
 
 	for {
-		if err := streamEvents(); err != nil {
+		if err := eventLoop(); err != nil {
 			log.Printf("events: %v", err)
 		}
 		time.Sleep(time.Second) // back off before reconnecting
 	}
 }
 
-type dockerEvent struct {
-	Type   string `json:"Type"`
-	Action string `json:"Action"`
-	Actor  struct {
-		ID         string            `json:"ID"`
-		Attributes map[string]string `json:"Attributes"`
-	} `json:"Actor"`
-}
-
-// detectNetwork reads our own container ID from /etc/hostname, inspects
-// ourselves via the Docker API, and returns the first non-default network.
-func detectNetwork() (string, error) {
-	hostname, err := os.ReadFile("/etc/hostname")
-	if err != nil {
-		return "", fmt.Errorf("read /etc/hostname: %w", err)
-	}
-	cid := strings.TrimSpace(string(hostname))
-
-	var info dockerInspect
-	if err := dockerGet("/containers/"+cid+"/json", &info); err != nil {
-		return "", fmt.Errorf("inspect self: %w", err)
-	}
-
-	for name := range info.NetworkSettings.Networks {
-		if name != "bridge" && name != "host" && name != "none" {
-			return name, nil
-		}
-	}
-	return "", fmt.Errorf("no custom network found on container %s", cid)
-}
-
-// tracked holds container IDs currently on our network.
-var tracked = map[string]struct{}{}
-
-func streamEvents() error {
-	// Listen for network connect/disconnect and container start/stop/die.
-	// filters: {"type":["network","container"],"event":["connect","disconnect","start","stop","die"]}
-	resp, err := dockerClient.Get("http://localhost/events?filters=%7B%22type%22%3A%5B%22network%22%2C%22container%22%5D%2C%22event%22%3A%5B%22connect%22%2C%22disconnect%22%2C%22start%22%2C%22stop%22%2C%22die%22%5D%7D")
+// Listen for docker events
+func eventLoop() error {
+	response, err := dockerClient.Get(eventsQuery)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer response.Body.Close()
 
-	dec := json.NewDecoder(resp.Body)
+	jsonDecoder := json.NewDecoder(response.Body)
 	for {
-		var ev dockerEvent
-		if err := dec.Decode(&ev); err != nil {
+		var event dockerEvent
+		if err := jsonDecoder.Decode(&event); err != nil {
 			return err
 		}
 
 		switch {
-		// Network connect/disconnect on the current network.
-		case ev.Type == "network" && ev.Actor.Attributes["name"] == networkName:
-			cid := ev.Actor.Attributes["container"]
-			if ev.Action == "connect" {
-				tracked[cid] = struct{}{}
-				log.Printf("event: network connect %s", cid[:12])
+		// Track containers that are connected to the current network
+		case event.Type == "network" && event.Actor.Attributes["name"] == networkName:
+			containerID := event.Actor.Attributes["container"]
+			if event.Action == "connect" {
+				nodes[containerID] = struct{}{}
 			} else {
-				delete(tracked, cid)
-				log.Printf("event: network disconnect %s", cid[:12])
-			}
-			if err := scan(); err != nil {
-				log.Printf("scan: %v", err)
+				// Remove routes when containers disconnect
+				delete(nodes, containerID)
+				removeRoutes(containerID)
 			}
 
-		// Container lifecycle — only scan if this container is tracked.
-		case ev.Type == "container":
-			if _, ok := tracked[ev.Actor.ID]; ok {
-				log.Printf("event: container %s %s", ev.Action, ev.Actor.ID[:12])
-				if err := scan(); err != nil {
-					log.Printf("scan: %v", err)
-				}
+		// Wait for the container to start before routing
+		case event.Type == "container":
+			// Ignore out of network containers
+			if _, ok := nodes[event.Actor.ID]; !ok {
+				continue
 			}
+			addRoutes(event.Actor.ID)
 		}
 	}
-}
-
-// Docker API response types (just the fields we need).
-type dockerContainer struct {
-	ID string `json:"Id"`
-}
-
-type dockerInspect struct {
-	Config struct {
-		Env          []string            `json:"Env"`
-		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	} `json:"Config"`
-	NetworkSettings struct {
-		Networks map[string]struct {
-			IPAddress string `json:"IPAddress"`
-		} `json:"Networks"`
-	} `json:"NetworkSettings"`
 }
 
 func dockerGet(path string, out interface{}) error {
-	resp, err := dockerClient.Get("http://localhost" + path)
+	response, err := dockerClient.Get("http://localhost" + path)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	return json.NewDecoder(resp.Body).Decode(out)
+	defer response.Body.Close()
+	return json.NewDecoder(response.Body).Decode(out)
 }
 
-func scan() error {
-	var containers []dockerContainer
-	filter := fmt.Sprintf("/containers/json?filters={%%22network%%22:%%5B%%22%s%%22%%5D}", networkName)
-	if err := dockerGet(filter, &containers); err != nil {
-		log.Printf("containers: %v", err)
-		return err
+// Escape JSON queries for the Docker API
+func dockerQuery(path string, filters interface{}) string {
+	query, _ := json.Marshal(filters)
+	return path + "?filters=" + url.QueryEscape(string(query))
+}
+
+// Parse a container's route config
+func addRoutes(containerID string) {
+	var container dockerInspect
+	if err := dockerGet("/containers/"+containerID+"/json", &container); err != nil {
+		log.Printf("inspect %s: %v", containerID[:12], err)
+		return
 	}
 
-	// Seed tracked set so we recognise future lifecycle events.
-	for _, c := range containers {
-		tracked[c.ID] = struct{}{}
+	var config string
+	for _, env := range container.Config.Env {
+		if strings.HasPrefix(env, "SUB2PORT=") {
+			config = strings.TrimPrefix(env, "SUB2PORT=")
+			break
+		}
+	}
+	if config == "" {
+		return
 	}
 
-	next := map[string]route{}
-
-	for _, c := range containers {
-		var info dockerInspect
-		if err := dockerGet("/containers/"+c.ID+"/json", &info); err != nil {
-			log.Printf("inspect %s: %v", c.ID[:12], err)
-			continue
-		}
-
-		fqdn := ""
-		explicitPort := ""
-		for _, env := range info.Config.Env {
-			if strings.HasPrefix(env, "SUB2PORT=") {
-				val := strings.TrimPrefix(env, "SUB2PORT=")
-				if host, p, err := net.SplitHostPort(val); err == nil {
-					fqdn = host
-					explicitPort = p
-				} else {
-					fqdn = val
-				}
-				break
-			}
-		}
-		if fqdn == "" {
-			continue
-		}
-
-		nw, ok := info.NetworkSettings.Networks[networkName]
-		if !ok || nw.IPAddress == "" {
-			continue
-		}
-
-		// Use explicit port from SUB2PORT, else first exposed port, else 80.
-		port := "80"
-		if explicitPort != "" {
-			port = explicitPort
-		} else {
-			for p := range info.Config.ExposedPorts {
-				port = strings.Split(p, "/")[0] // "8080/tcp" -> "8080"
-				break
-			}
-		}
-
-		next[fqdn] = route{Host: nw.IPAddress, Port: port}
-		log.Printf("update %s: %v", fqdn, next[fqdn])
+	network, ok := container.NetworkSettings.Networks[networkName]
+	if !ok || network.IPAddress == "" {
+		return
 	}
 
-	mu.Lock()
-	routes = next
-	mu.Unlock()
-	return nil
+	name := strings.TrimPrefix(container.Name, "/")
+
+	// Default port: first exposed port, else 80.
+	defaultPort := "80"
+	for _port := range container.Config.ExposedPorts {
+		defaultPort = strings.Split(_port, "/")[0] // "8080/tcp" -> "8080"
+		break
+	}
+
+	var domains []string
+	routesLock.Lock()
+	for _, entry := range strings.Split(config, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		domain, port := entry, defaultPort
+		if _domain, _port, err := net.SplitHostPort(entry); err == nil {
+			domain = _domain
+			port = _port
+		}
+		routes[domain] = route{Name: name, Host: network.IPAddress, Port: port}
+		domains = append(domains, domain)
+		log.Printf("+ %s -> %s:%s", domain, name, port)
+	}
+	registry[containerID] = domains
+	routesLock.Unlock()
+}
+
+// Remove routes to a container
+func removeRoutes(containerID string) {
+	routesLock.Lock()
+	for _, domain := range registry[containerID] {
+		if route, ok := routes[domain]; ok {
+			log.Printf("- %s -> %s:%s", domain, route.Name, route.Port)
+			delete(routes, domain)
+		}
+	}
+	delete(registry, containerID)
+	routesLock.Unlock()
 }

@@ -1,0 +1,19 @@
+services:
+  app1:
+    image: traefik/whoami
+    environment:
+      SUB2PORT: test.com:80
+    networks:
+      - p80
+    restart: unless-stopped
+  app2:
+    image: traefik/whoami
+    environment:
+      SUB2PORT: example.test.com:80
+    networks:
+      - p80
+    restart: unless-stopped
+
+networks:
+  p80:
+    external: true
