@@ -1,0 +1,12 @@
+services:
+  sub2port:
+    image: sub2port
+    ports:
+      - "18084:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+  app:
+    image: traefik/whoami
+    command: ["--port", "8080"]
+    environment:
+      SUB2PORT: app.test:8080
