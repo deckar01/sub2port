@@ -4,7 +4,13 @@
 - Containers declare their own host name, so the config is decentralized
 - The routing table updates automatically in response to docker events
 - Ports never have to be exposed, so no more errors about ports already in use
-- Multiple container bound to the same host name are routed round-robin
+- Multiple containers bound to the same host name are routed round-robin
+
+## Why?
+
+The existing reverse proxies for docker have a lot of open issues, because they
+manage an nginx config and must support its API. I just proxy host names with go.
+Any other features you need should probably sit in front of or behind this container.
 
 ## Compose
 
@@ -47,3 +53,11 @@ docker run -d -e SUB2PORT=test.com:5555 --network p80 your/image
    - The container port is optional and defaults to the first open port (does not have to be exposed)
    - Additional hosts can be separated with commas
  - `--network <name>` - The network that is joined determines the host port that is used
+
+## Contributing
+
+Prefer publishing a fork to opening a feature request.
+
+Run your fork in production for a while before opening a pull request.
+
+The `.github/workflows/docker-publish.yml` action publishes on push. Follow [these docs](https://github.com/elgohr/Publish-Docker-Github-Action?tab=readme-ov-file#mandatory-arguments) to start publishing your changes.
