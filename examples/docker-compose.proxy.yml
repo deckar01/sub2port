@@ -1,6 +1,6 @@
 services:
   sub2port:
-    image: deckar01/sub2port
+    image: sub2port
     ports:
       - "80:80"
     volumes:

@@ -165,26 +165,79 @@ func TestSingleHost(t *testing.T) {
 	}
 }
 
-func TestRoundRobin(t *testing.T) {
+func TestOverride(t *testing.T) {
 	seq := []string{
 		"# using network",
 		"# listening on",
 		"+ app.test (1)",
 		"+ app.test (2)",
 	}
-	logs := setup(t, "round-robin.yml", seq)
+	logs := setup(t, "override.yml", seq)
 	assertLogSequence(t, logs, seq)
 
-	_, body1 := get(t, 18082, "app.test")
-	_, body2 := get(t, 18082, "app.test")
-
-	h1 := whoamiHostname(body1)
-	h2 := whoamiHostname(body2)
-	if h1 == "" || h2 == "" {
-		t.Fatalf("could not parse whoami hostnames\nbody1:\n%s\nbody2:\n%s", body1, body2)
+	code1, body1 := get(t, 18082, "app.test")
+	code2, body2 := get(t, 18082, "app.test")
+	if code1 != 200 || code2 != 200 {
+		t.Fatalf("expected 200 for both requests, got %d and %d", code1, code2)
 	}
-	if h1 == h2 {
-		t.Fatalf("round-robin failed: both requests went to %s", h1)
+
+	if !strings.Contains(body1, "Host: app.test") {
+		t.Fatalf("override failed: stale container %s", body1)
+	}
+
+	if !strings.Contains(body2, "Host: app.test") {
+		t.Fatalf("override failed: stale container %s", body2)
+	}
+
+	hostname1 := whoamiHostname(body1)
+	hostname2 := whoamiHostname(body2)
+	if hostname1 == "" || hostname2 == "" {
+		t.Fatalf("override failed: missing Hostname field\nbody1:\n%s\nbody2:\n%s", body1, body2)
+	}
+	if hostname1 != hostname2 {
+		t.Fatalf("override failed: requests routed to different containers: %s != %s", hostname1, hostname2)
+	}
+}
+
+func TestOverrideRestartOrder(t *testing.T) {
+	seq := []string{
+		"# using network",
+		"# listening on",
+		"+ app.test (1)",
+		"+ app.test (2)",
+	}
+	setup(t, "override.yml", seq)
+
+	// Check the initial container ID
+	code, body := get(t, 18082, "app.test")
+	if code != 200 {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	before := whoamiHostname(body)
+	if before == "" {
+		t.Fatalf("response missing Hostname field\n%s", body)
+	}
+
+	// Restart sub2port
+	file := filepath.Join(testsDir, "override.yml")
+	project := "sub2port-test-override"
+	cmd := exec.Command("docker", "compose", "-f", file, "-p", project, "restart", "sub2port")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compose restart sub2port: %v\n%s", err, out)
+	}
+
+	// The container should not change
+	code, body = get(t, 18082, "app.test")
+	if code != 200 {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	after := whoamiHostname(body)
+	if after == "" {
+		t.Fatalf("response missing Hostname field\n%s", body)
+	}
+	if before != after {
+		t.Fatalf("container changed after restart: before=%s after=%s", before, after)
 	}
 }
 

@@ -61,7 +61,6 @@ type route struct {
 
 type hostEntry struct {
 	backends []route
-	counter  uint64
 }
 
 type binding struct {
@@ -169,9 +168,7 @@ func proxy(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, fmt.Sprintf("no backend for %s", host), http.StatusBadGateway)
 		return
 	}
-	idx := entry.counter % uint64(len(entry.backends))
-	entry.counter++
-	backend := entry.backends[idx]
+	backend := entry.backends[len(entry.backends)-1]
 	table.Unlock()
 
 	target, _ := url.Parse(fmt.Sprintf("http://%s:%s", backend.Host, backend.Port))
